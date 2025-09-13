@@ -1,24 +1,28 @@
 import { WebSocketServer } from "ws";
-import OpenAI from "openai";
-import dotenv from "dotenv";
-import { Readable } from "stream";
-
-dotenv.config();
-
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
-// helper: turn Buffer into stream (needed for STT)
-function bufferToStream(buffer) {
-  const stream = new Readable();
-  stream.push(buffer);
-  stream.push(null);
-  return stream;
-}
 
 const PORT = process.env.PORT || 8080;
 const wss = new WebSocketServer({ port: PORT });
+
+console.log(`✅ WebSocket server running on ws://localhost:${PORT}`);
+
+// Generate a simple beep-like PCM buffer for demo
+function generateBeepPCM(durationMs = 500, frequency = 440) {
+  const sampleRate = 8000; // 8kHz for Exotel
+  const samples = Math.floor((durationMs / 1000) * sampleRate);
+  const buffer = Buffer.alloc(samples * 2); // 16-bit PCM
+
+  for (let i = 0; i < samples; i++) {
+    const t = i / sampleRate;
+    const amplitude = Math.floor(Math.sin(2 * Math.PI * frequency * t) * 32767);
+    buffer.writeInt16LE(amplitude, i * 2);
+  }
+
+  return buffer;
+}
+
+// Pre-generate a fixed PCM for the fixed phrase
+const fixedResponsePCM = generateBeepPCM(1000); // 1-second beep
+const fixedResponseBase64 = fixedResponsePCM.toString("base64");
 
 wss.on("connection", (socket) => {
   console.log("📞 New Exotel call connected!");
@@ -34,7 +38,6 @@ wss.on("connection", (socket) => {
       return;
     }
 
-    // handle Exotel events
     if (data.event === "connected") {
       console.log("✅ Call connected:", data);
     }
@@ -45,48 +48,18 @@ wss.on("connection", (socket) => {
     }
 
     if (data.event === "media") {
-      try {
-        // 1. Decode Base64 PCM audio from Exotel
-        const audioBuffer = Buffer.from(data.media.payload, "base64");
+      console.log("🎧 Received caller audio chunk (ignored for demo)");
 
-        // 2. Send to OpenAI STT
-        const sttResp = await openai.audio.transcriptions.create({
-          file: bufferToStream(audioBuffer),
-          model: "gpt-4o-transcribe",
-        });
+      // Send back fixed response
+      socket.send(
+        JSON.stringify({
+          event: "media",
+          streamSid: data.streamSid,
+          media: { payload: fixedResponseBase64 },
+        })
+      );
 
-        const callerText = sttResp.text;
-        console.log(`👤 Caller (${callId}):`, callerText);
-
-        // 3. GPT response
-        const gptResp = await openai.chat.completions.create({
-          model: "gpt-4.1-mini",
-          messages: [{ role: "user", content: callerText }],
-        });
-
-        const aiText = gptResp.choices[0].message.content;
-        console.log(`🤖 AI (${callId}):`, aiText);
-
-        // 4. TTS
-        const ttsResp = await openai.audio.speech.create({
-          model: "gpt-4o-mini-tts",
-          voice: "verse",
-          input: aiText,
-        });
-
-        const aiAudio = Buffer.from(await ttsResp.arrayBuffer());
-
-        // 5. Send back as Base64 JSON media event
-        socket.send(
-          JSON.stringify({
-            event: "media",
-            streamSid: data.streamSid,
-            media: { payload: aiAudio.toString("base64") },
-          })
-        );
-      } catch (err) {
-        console.error("❌ Processing error:", err);
-      }
+      console.log(`🤖 Sent fixed response to ${callId}: "I am fine, how are you?"`);
     }
 
     if (data.event === "stop") {
@@ -98,5 +71,3 @@ wss.on("connection", (socket) => {
     console.log(`☎️ Call ended: ${callId}`);
   });
 });
-
-console.log(`✅ WebSocket server running on ws://localhost:${PORT}`);
