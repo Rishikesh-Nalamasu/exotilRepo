@@ -1,54 +1,73 @@
 import { WebSocketServer } from "ws";
 import OpenAI from "openai";
 import dotenv from "dotenv";
+import { Readable } from "stream";
 
-dotenv.config(); // loads .env into process.env
+dotenv.config();
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// start websocket server
-const wss = new WebSocketServer({ port: 8080 });
+// helper: turn Buffer into stream (needed for STT)
+function bufferToStream(buffer) {
+  const stream = new Readable();
+  stream.push(buffer);
+  stream.push(null);
+  return stream;
+}
 
-wss.on("connection", (socket, req) => {
-  console.log("New Exotel call connected!");
+const PORT = process.env.PORT || 8080;
+const wss = new WebSocketServer({ port: PORT });
 
-  // optional: extract callId from query params
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const callId = url.searchParams.get("callId") || "unknown";
+wss.on("connection", (socket) => {
+  console.log("📞 New Exotel call connected!");
 
-  let audioBuffer = [];
+  let callId = "unknown";
 
-  socket.on("message", async (msg) => {
-    // 1. Exotel sends audio (binary PCM/ulaw chunks)
-    audioBuffer.push(msg);
+  socket.on("message", async (rawMsg) => {
+    let data;
+    try {
+      data = JSON.parse(rawMsg.toString());
+    } catch (e) {
+      console.error("❌ Non-JSON message:", rawMsg.toString());
+      return;
+    }
 
-    // Simple demo: process when enough audio arrives
-    if (audioBuffer.length > 20) {
-      const audioData = Buffer.concat(audioBuffer);
-      audioBuffer = [];
+    // handle Exotel events
+    if (data.event === "connected") {
+      console.log("✅ Call connected:", data);
+    }
 
+    if (data.event === "start") {
+      callId = data.start?.callSid || "unknown";
+      console.log("▶️ Call started:", callId);
+    }
+
+    if (data.event === "media") {
       try {
-        // 2. STT: Caller audio → text
+        // 1. Decode Base64 PCM audio from Exotel
+        const audioBuffer = Buffer.from(data.media.payload, "base64");
+
+        // 2. Send to OpenAI STT
         const sttResp = await openai.audio.transcriptions.create({
-          file: new Blob([audioData]),
+          file: bufferToStream(audioBuffer),
           model: "gpt-4o-transcribe",
         });
 
         const callerText = sttResp.text;
-        console.log(`Caller (${callId}):`, callerText);
+        console.log(`👤 Caller (${callId}):`, callerText);
 
-        // 3. GPT: Generate response
+        // 3. GPT response
         const gptResp = await openai.chat.completions.create({
           model: "gpt-4.1-mini",
           messages: [{ role: "user", content: callerText }],
         });
 
         const aiText = gptResp.choices[0].message.content;
-        console.log(`AI Response (${callId}):`, aiText);
+        console.log(`🤖 AI (${callId}):`, aiText);
 
-        // 4. TTS: Text → speech
+        // 4. TTS
         const ttsResp = await openai.audio.speech.create({
           model: "gpt-4o-mini-tts",
           voice: "verse",
@@ -57,18 +76,27 @@ wss.on("connection", (socket, req) => {
 
         const aiAudio = Buffer.from(await ttsResp.arrayBuffer());
 
-        // 5. Send back audio to Exotel
-        socket.send(aiAudio);
+        // 5. Send back as Base64 JSON media event
+        socket.send(
+          JSON.stringify({
+            event: "media",
+            streamSid: data.streamSid,
+            media: { payload: aiAudio.toString("base64") },
+          })
+        );
       } catch (err) {
-        console.error("Processing error:", err);
+        console.error("❌ Processing error:", err);
       }
+    }
+
+    if (data.event === "stop") {
+      console.log("⏹️ Call stopped:", callId);
     }
   });
 
   socket.on("close", () => {
-    console.log(`Call ended: ${callId}`);
+    console.log(`☎️ Call ended: ${callId}`);
   });
 });
 
-console.log("✅ WebSocket server running on ws://localhost:8080");
-
+console.log(`✅ WebSocket server running on ws://localhost:${PORT}`);
